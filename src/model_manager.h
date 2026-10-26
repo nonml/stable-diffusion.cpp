@@ -268,6 +268,15 @@ public:
     bool validate_registered_tensors();
     bool load_all_params_eagerly();
 
+    // Loads tensors that are deliberately NOT registered with the manager, such as
+    // tensor-parallel (--split-mode tensor) weights that live permanently in a GGML meta
+    // buffer. Source lookup, multi-part assembly and shape validation match registered
+    // tensors; every tensor that is not ignored/optional must be present and loaded.
+    bool load_unmanaged_tensors(ModelComponent component,
+                                const std::map<std::string, ggml_tensor*>& tensors,
+                                ModelLoader::FileId source_file = 0,
+                                SDVersion source_version        = VERSION_COUNT);
+
     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
                                 ggml_backend_t compute_backend) override;
     bool prepare_params(const std::vector<ggml_tensor*>& tensors) override;

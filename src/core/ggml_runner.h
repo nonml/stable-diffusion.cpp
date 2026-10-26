@@ -15,6 +15,7 @@
 #include "core/compute_workspace.h"
 #include "core/ggml_graph_cut.h"
 #include "core/runner_cache.h"
+#include "core/tensor_parallel.h"
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
 #include "device_residency_manager.h"
@@ -170,6 +171,15 @@ protected:
 
     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
     bool multi_device_eval_callback_warned = false;
+
+    // Tensor parallelism (--split-mode tensor): runtime_backend is a GGML meta backend and
+    // params_ctx is allocated directly on it (split across the devices, never managed by
+    // the residency manager). tp_device_backends_ are the matching single-device backends
+    // used for memory accounting only.
+    ggml_backend_buffer_t tp_params_buffer_ = nullptr;
+    size_t tp_params_bytes_                 = 0;
+    std::vector<ggml_backend_t> tp_device_backends_;  // borrowed (SDBackendManager-owned)
+    bool tp_eval_callback_warned_ = false;
 
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
     std::weak_ptr<DeviceResidencyManager> residency_manager;
@@ -390,6 +400,21 @@ public:
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits);
 
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends);
+
+    bool tensor_parallel() const {
+        return sd::tp::backend_is_meta(runtime_backend);
+    }
+
+    void set_tensor_parallel_device_backends(const std::vector<ggml_backend_t>& backends) {
+        tp_device_backends_ = backends;
+    }
+
+    // Allocates all params on the meta backend using the registered split states.
+    bool alloc_tensor_parallel_params(std::string* error);
+
+    size_t tensor_parallel_params_bytes() const {
+        return tp_params_bytes_;
+    }
 };
 
 #endif  // __SD_CORE_GGML_RUNNER_H__

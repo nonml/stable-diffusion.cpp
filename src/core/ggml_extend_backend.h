@@ -43,6 +43,9 @@ using SDBackendHandle = std::unique_ptr<struct ggml_backend, SDBackendHandleDele
 enum class SDSplitMode {
     LAYER,
     ROW,
+    // Tensor parallelism on a GGML meta device: every listed device computes every layer
+    // on its slice of the weights (diffusion module only).
+    TENSOR,
 };
 
 class SDBackendManager {
@@ -80,9 +83,18 @@ public:
     bool params_backend_follows_runtime(SDBackendModule module) const;
     bool runtime_backend_supports_host_buffer(SDBackendModule module);
 
+    // True when `module` runs on a tensor-parallel meta backend (--split-mode tensor with
+    // a device list). runtime_backend()/params_backend() then return the meta backend.
+    bool tensor_parallel_active(SDBackendModule module) const;
+    // The per-device ("simple") backends behind a tensor-parallel module, as cached
+    // single-device backends shared with other modules. Empty when not tensor-parallel.
+    std::vector<ggml_backend_t> tensor_parallel_device_backends(SDBackendModule module);
+
 private:
     bool validate(std::string* error) const;
     ggml_backend_t init_cached_backend(const std::string& name);
+    ggml_backend_t init_meta_backend(SDBackendModule module);
+    bool tensor_parallel_params_warned_ = false;
 };
 
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);

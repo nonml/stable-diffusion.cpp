@@ -1,6 +1,7 @@
 #include "diffusion_engine.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -189,6 +190,8 @@ bool StableDiffusionGGML::reset_runners(const RunnerGroups& groups) {
                 ip_adapter_tokens        = {};
                 ip_adapter_uncond_tokens = {};
                 runtime_lora_models.clear();
+                tensor_parallel_pending_load_.clear();
+                tensor_parallel_model_tensor_names_.clear();
                 break;
             case RunnerGroup::VAE:
                 first_stage_model.reset();
@@ -329,6 +332,14 @@ bool StableDiffusionGGML::register_runner_params(ModelComponent component,
     if (model_manager == nullptr) {
         return true;
     }
+    if (backend_manager.tensor_parallel_active(module)) {
+        if constexpr (std::is_base_of_v<GGMLRunner, T>) {
+            return register_tensor_parallel_runner_params(component, *model, module, std::move(group_tensors), params_mem_size);
+        } else {
+            LOG_ERROR("--split-mode tensor does not support the %s component", model_component_name(component));
+            return false;
+        }
+    }
     ModelManager::ResidencyMode residency_mode =
         backend_manager.params_backend_is_disk(module) ? ModelManager::ResidencyMode::Disk : ModelManager::ResidencyMode::ParamBackend;
 
@@ -369,6 +380,69 @@ bool StableDiffusionGGML::register_runner_params(ModelComponent component,
                                                  false,
                                                  false,
                                                  &tensor_ops);
+}
+
+bool StableDiffusionGGML::register_tensor_parallel_runner_params(ModelComponent component,
+                                                                 GGMLRunner& runner,
+                                                                 SDBackendModule module,
+                                                                 std::map<std::string, ggml_tensor*> group_tensors,
+                                                                 size_t* params_mem_size) {
+    const std::string desc = runner.get_desc();
+    if (component != ModelComponent::Diffusion || desc != "qwen_image_2_1") {
+        LOG_ERROR("--split-mode tensor currently supports only the Qwen Image 2.1 diffusion model (got %s for %s)",
+                  desc.c_str(), model_component_name(component));
+        return false;
+    }
+    if (!runner.tensor_parallel()) {
+        LOG_ERROR("--split-mode tensor: %s did not get a meta backend", desc.c_str());
+        return false;
+    }
+    std::vector<ggml_backend_t> devices = backend_manager.tensor_parallel_device_backends(module);
+    if (devices.size() < 2) {
+        LOG_ERROR("--split-mode tensor: failed to initialize the split device backends");
+        return false;
+    }
+    runner.set_tensor_parallel_device_backends(devices);
+
+    const std::string norm_q_suffix = ".transformer_blocks.0.attn.norm_q.weight";
+    std::string prefix;
+    int64_t head_dim = 0;
+    for (const auto& [name, tensor] : group_tensors) {
+        if (tensor != nullptr && ends_with(name, norm_q_suffix)) {
+            prefix   = name.substr(0, name.size() - norm_q_suffix.size());
+            head_dim = tensor->ne[0];
+            break;
+        }
+    }
+    if (head_dim <= 0) {
+        LOG_ERROR("--split-mode tensor: could not find the attention head size of %s", desc.c_str());
+        return false;
+    }
+    size_t split_count = 0;
+    std::string error;
+    if (!sd::tp::assign_qwen_image_2_1_splits(group_tensors, prefix, head_dim, devices.size(), &split_count, &error)) {
+        LOG_ERROR("--split-mode tensor: %s", error.c_str());
+        return false;
+    }
+    if (split_count == 0) {
+        LOG_ERROR("--split-mode tensor: no %s weights matched the split rules (prefix '%s')", desc.c_str(), prefix.c_str());
+        return false;
+    }
+    if (!runner.alloc_tensor_parallel_params(&error)) {
+        LOG_ERROR("--split-mode tensor: allocating %s weights failed: %s", desc.c_str(), error.c_str());
+        return false;
+    }
+    const size_t bytes = runner.tensor_parallel_params_bytes();
+    LOG_INFO("tensor split: %s: %zu of %zu weights split across %zu devices (head size %" PRId64 "), %.2f MB total on the split devices",
+             desc.c_str(), split_count, group_tensors.size(), devices.size(), head_dim, bytes / (1024.0 * 1024.0));
+    if (params_mem_size != nullptr) {
+        *params_mem_size += bytes;
+    }
+    for (const auto& entry : group_tensors) {
+        tensor_parallel_model_tensor_names_.insert(entry.first);
+        tensor_parallel_pending_load_[entry.first] = entry.second;
+    }
+    return true;
 }
 
 template <typename T>
@@ -850,6 +924,10 @@ bool StableDiffusionGGML::set_sage_attention_enabled(bool enabled) {
     if (!diffusion_model) {
         return false;
     }
+    if (enabled && backend_manager.tensor_parallel_active(SDBackendModule::DIFFUSION)) {
+        LOG_WARN("SageAttention is not supported with --split-mode tensor; using flash attention instead");
+        return true;
+    }
     if (enabled) {
 #ifndef SD_USE_UPSTREAM_GGML
         auto* ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
@@ -935,6 +1013,14 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     params_backend_spec       = SAFE_STR(sd_ctx_params->params_backend);
     split_mode_spec           = SAFE_STR(sd_ctx_params->split_mode);
     auto_fit_enabled          = sd_ctx_params->auto_fit && params_backend_spec.empty();
+    std::string split_mode_lower = split_mode_spec;
+    std::transform(split_mode_lower.begin(), split_mode_lower.end(), split_mode_lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (auto_fit_enabled && split_mode_lower.find("tensor") != std::string::npos) {
+        // Auto-fit rewrites the backend assignment; tensor split needs the explicit device list.
+        LOG_INFO("auto-fit is disabled with --split-mode tensor");
+        auto_fit_enabled = false;
+    }
     max_vram_assignment.reset(0.f);
     {
         std::string error;
@@ -1043,7 +1129,8 @@ void StableDiffusionGGML::configure_weight_loading() {
         const bool streaming_constrained = params_offloaded ||
                                            backend_manager.params_backend_is_disk(SDBackendModule::DIFFUSION);
 
-        if (have_quant_type_rule || have_quantized_weight || streaming_constrained || row_split_active()) {
+        if (have_quant_type_rule || have_quantized_weight || streaming_constrained || row_split_active() ||
+            backend_manager.tensor_parallel_active(SDBackendModule::DIFFUSION)) {
             apply_lora_immediately = false;
         } else {
             apply_lora_immediately = true;
@@ -1058,6 +1145,11 @@ void StableDiffusionGGML::configure_weight_loading() {
             LOG_WARN(
                 "row-split tensors do not support the immediately LoRA apply mode; "
                 "LoRAs will not be applied to them (use --lora-apply-mode at_runtime)");
+            apply_lora_immediately = false;
+        } else if (backend_manager.tensor_parallel_active(SDBackendModule::DIFFUSION)) {
+            LOG_WARN(
+                "--split-mode tensor does not support the immediately LoRA apply mode; "
+                "using at_runtime instead");
             apply_lora_immediately = false;
         } else {
             apply_lora_immediately = true;
@@ -1197,6 +1289,10 @@ bool StableDiffusionGGML::flash_attention_for(SDBackendModule module) {
     if (mode == "off") {
         return false;
     }
+    if (backend_manager.tensor_parallel_active(module)) {
+        // Tensor split attention requires the flash attention kernel (heads split by device).
+        return true;
+    }
     if (strlen(SAFE_STR(params.flash_attn_mode)) == 0) {
         if (params.flash_attn) {
             return true;
@@ -1227,6 +1323,9 @@ bool StableDiffusionGGML::conv_direct_for(SDBackendModule module, bool conv3d) {
     const std::string mode = conv_direct_assignment.get(module);
     if (mode == "on" || mode == "off") {
         return mode == "on";
+    }
+    if (backend_manager.tensor_parallel_active(module)) {
+        return false;
     }
     if (strlen(SAFE_STR(params.conv_direct_mode)) == 0 &&
         (module == SDBackendModule::VAE ? params.vae_conv_direct : params.diffusion_conv_direct)) {
@@ -1271,6 +1370,10 @@ bool StableDiffusionGGML::validate_and_load_runners() {
         }
     }
     const bool diffusion_fa = flash_attention_for(SDBackendModule::DIFFUSION);
+    if (!diffusion_fa && backend_manager.tensor_parallel_active(SDBackendModule::DIFFUSION)) {
+        LOG_ERROR("--split-mode tensor requires flash attention for the diffusion model (remove diffusion=off from --flash-attn)");
+        return false;
+    }
     diffusion_model->set_flash_attention_enabled(diffusion_fa);
     if (high_noise_diffusion_model) {
         high_noise_diffusion_model->set_flash_attention_enabled(diffusion_fa);
@@ -1366,6 +1469,16 @@ bool StableDiffusionGGML::validate_and_load_runners() {
         LOG_ERROR("model metadata validation failed");
         return false;
     }
+    if (!tensor_parallel_pending_load_.empty()) {
+        const int64_t t0 = ggml_time_ms();
+        if (!model_manager->load_unmanaged_tensors(ModelComponent::Diffusion, tensor_parallel_pending_load_)) {
+            LOG_ERROR("--split-mode tensor: loading the diffusion model weights failed");
+            return false;
+        }
+        LOG_INFO("tensor split: loaded %zu diffusion tensors in %.2fs",
+                 tensor_parallel_pending_load_.size(), (ggml_time_ms() - t0) / 1000.0);
+        tensor_parallel_pending_load_.clear();
+    }
 
     if (eager_load) {
         if (!model_manager->load_all_params_eagerly()) {
@@ -1380,6 +1493,9 @@ bool StableDiffusionGGML::validate_and_load_runners() {
     {
         size_t text_encoder_params_mem_size = model_manager->registered_params_size({ModelComponent::Conditioner});
         size_t unet_params_mem_size         = model_manager->registered_params_size({ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion});
+        if (diffusion_model && diffusion_model->tensor_parallel()) {
+            unet_params_mem_size += diffusion_model->tensor_parallel_params_bytes();
+        }
         size_t vae_params_mem_size          = model_manager->registered_params_size(runner_components().at(RunnerGroup::VAE));
         size_t control_net_params_mem_size  = model_manager->registered_params_size({ModelComponent::ControlNet});
         size_t extension_params_mem_size    = model_manager->registered_params_size(runner_components().at(RunnerGroup::Extensions));
@@ -1684,6 +1800,10 @@ std::vector<std::shared_ptr<LoraModel>> StableDiffusionGGML::load_runtime_loras_
             if (lora_spec.required) {
                 LOG_ERROR("required lora load failed: %s", lora_spec.path.c_str());
                 success = false;
+            } else if (backend_manager.tensor_parallel_active(module)) {
+                // Never silently drop a LoRA from a tensor-split model.
+                LOG_ERROR("lora load failed with --split-mode tensor: %s", lora_spec.path.c_str());
+                success = false;
             }
             continue;
         }
@@ -1733,6 +1853,7 @@ bool StableDiffusionGGML::apply_loras_at_runtime(const std::vector<ModelManager:
     if (model_manager != nullptr) {
         model_tensor_names = model_manager->tensor_names();
     }
+    model_tensor_names.insert(tensor_parallel_model_tensor_names_.begin(), tensor_parallel_model_tensor_names_.end());
 
     LOG_INFO("apply lora at runtime");
     if (cond_stage_model) {

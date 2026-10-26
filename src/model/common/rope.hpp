@@ -9,6 +9,7 @@
 #include <vector>
 #include "core/ggml_extend.h"
 #include "core/ggml_runner.h"
+#include "core/tensor_parallel.h"
 #include "core/util.h"
 
 namespace Rope {
@@ -1074,7 +1075,9 @@ namespace Rope {
         auto ctx = runner_ctx->ggml_ctx;
 #ifndef SD_USE_UPSTREAM_GGML
         auto backend = runner_ctx->backend;
-        if (backend != nullptr && x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
+        // The meta (tensor-split) backend cannot propagate split states through
+        // GGML_OP_ROPE_APPLY; the decomposed path below uses supported ops only.
+        if (backend != nullptr && !sd::tp::backend_is_meta(backend) && x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
             x->ne[0] % 2 == 0 && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == x->ne[0] / 2 && pe->ne[3] == x->ne[2]) {
             auto out = ggml_rope_apply(ctx, x, pe, rope_interleaved);

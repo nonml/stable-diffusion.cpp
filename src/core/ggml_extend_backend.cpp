@@ -17,6 +17,7 @@
 #include <hip/hip_runtime_api.h>
 #endif
 
+#include "core/tensor_parallel.h"
 #include "core/util.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -932,11 +933,94 @@ static std::string primary_device_name(const std::string& value) {
 }
 
 ggml_backend_t SDBackendManager::runtime_backend(SDBackendModule module) {
+    if (tensor_parallel_active(module)) {
+        return init_meta_backend(module);
+    }
     return init_cached_backend(primary_device_name(runtime_assignment_.get(module)));
+}
+
+bool SDBackendManager::tensor_parallel_active(SDBackendModule module) const {
+    return module == SDBackendModule::DIFFUSION &&
+           lower_copy(trim_copy(split_mode_assignment_.get(module))) == "tensor" &&
+           split_device_list(runtime_assignment_.get(module)).size() > 1;
+}
+
+std::vector<ggml_backend_t> SDBackendManager::tensor_parallel_device_backends(SDBackendModule module) {
+    std::vector<ggml_backend_t> backends;
+    if (!tensor_parallel_active(module)) {
+        return backends;
+    }
+    for (const std::string& name : split_device_list(runtime_assignment_.get(module))) {
+        ggml_backend_t backend = init_cached_backend(name);
+        if (backend == nullptr) {
+            return {};
+        }
+        backends.push_back(backend);
+    }
+    return backends;
+}
+
+ggml_backend_t SDBackendManager::init_meta_backend(SDBackendModule module) {
+    const std::vector<std::string> names = split_device_list(runtime_assignment_.get(module));
+    std::vector<ggml_backend_dev_t> devices;
+    std::string key = "meta(";
+    for (const std::string& name : names) {
+        const std::string resolved = sd_backend_resolve_name(name);
+        ggml_backend_dev_t dev     = resolve_device_by_name(resolved);
+        if (dev == nullptr) {
+            dev = resolve_first_device_by_registry_name(name);
+        }
+        if (dev == nullptr) {
+            LOG_ERROR("tensor split: backend '%s' was not found", name.c_str());
+            return nullptr;
+        }
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            LOG_ERROR("tensor split: device '%s' is not a GPU; --split-mode tensor only supports GPU devices",
+                      ggml_backend_dev_name(dev));
+            return nullptr;
+        }
+        if (std::find(devices.begin(), devices.end(), dev) != devices.end()) {
+            LOG_ERROR("tensor split: device '%s' is listed more than once", ggml_backend_dev_name(dev));
+            return nullptr;
+        }
+        if (devices.size() >= GGML_BACKEND_META_MAX_DEVICES) {
+            LOG_ERROR("tensor split supports at most %d devices", GGML_BACKEND_META_MAX_DEVICES);
+            return nullptr;
+        }
+        key += (devices.empty() ? "" : ",") + lower_copy(ggml_backend_dev_name(dev));
+        devices.push_back(dev);
+    }
+    key += ")";
+    auto it = backends_.find(key);
+    if (it != backends_.end()) {
+        return it->second.get();
+    }
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devices.data(), devices.size(), sd::tp::get_split_state, nullptr);
+    if (meta_dev == nullptr) {
+        LOG_ERROR("tensor split: failed to create the meta device");
+        return nullptr;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);
+    if (backend == nullptr) {
+        LOG_ERROR("tensor split: failed to initialize the meta backend");
+        return nullptr;
+    }
+    LOG_INFO("tensor split: %s module runs on a meta backend over %zu devices (%s)",
+             sd_backend_module_name(module), devices.size(), key.c_str());
+    backends_.emplace(key, SDBackendHandle(backend));
+    return backend;
 }
 
 std::vector<ggml_backend_t> SDBackendManager::runtime_backends(SDBackendModule module) {
     std::vector<ggml_backend_t> backends;
+    if (tensor_parallel_active(module)) {
+        ggml_backend_t backend = runtime_backend(module);
+        if (backend != nullptr) {
+            backends.push_back(backend);
+        }
+        return backends;
+    }
     for (const std::string& name : split_device_list(runtime_assignment_.get(module))) {
         ggml_backend_t backend = init_cached_backend(name);
         if (backend == nullptr) {
@@ -960,6 +1044,15 @@ std::vector<ggml_backend_t> SDBackendManager::runtime_backends(SDBackendModule m
 
 ggml_backend_t SDBackendManager::params_backend(SDBackendModule module) {
     std::string name = params_assignment_.get(module);
+    if (tensor_parallel_active(module)) {
+        // Tensor-split weights live sliced on the meta device's GPUs and stay resident.
+        if (!name.empty() && !tensor_parallel_params_warned_) {
+            LOG_WARN("tensor split: ignoring params backend '%s' for the %s module; its weights stay resident on the split devices",
+                     name.c_str(), sd_backend_module_name(module));
+            tensor_parallel_params_warned_ = true;
+        }
+        return runtime_backend(module);
+    }
     if (name.empty()) {
         return runtime_backend(module);
     }
@@ -978,10 +1071,16 @@ bool SDBackendManager::params_backend_is_cpu(SDBackendModule module) {
 }
 
 bool SDBackendManager::params_backend_is_disk(SDBackendModule module) const {
+    if (tensor_parallel_active(module)) {
+        return false;
+    }
     return is_disk_backend_token(params_assignment_.get(module));
 }
 
 bool SDBackendManager::params_backend_follows_runtime(SDBackendModule module) const {
+    if (tensor_parallel_active(module)) {
+        return true;
+    }
     return params_assignment_.get(module).empty();
 }
 
@@ -1022,8 +1121,14 @@ bool SDBackendManager::init(const char* backend_spec,
 }
 
 SDSplitMode SDBackendManager::split_mode(SDBackendModule module) const {
-    return lower_copy(trim_copy(split_mode_assignment_.get(module))) == "row" ? SDSplitMode::ROW
-                                                                              : SDSplitMode::LAYER;
+    const std::string mode = lower_copy(trim_copy(split_mode_assignment_.get(module)));
+    if (mode == "row") {
+        return SDSplitMode::ROW;
+    }
+    if (mode == "tensor") {
+        return SDSplitMode::TENSOR;
+    }
+    return SDSplitMode::LAYER;
 }
 
 ggml_backend_buffer_type_t SDBackendManager::split_buffer_type(ggml_backend_t backend,
@@ -1116,11 +1221,11 @@ bool SDBackendManager::validate(std::string* error) const {
     };
     auto validate_split_mode_name = [&](const std::string& name) -> bool {
         const std::string lower = lower_copy(trim_copy(name));
-        if (lower.empty() || lower == "layer" || lower == "row") {
+        if (lower.empty() || lower == "layer" || lower == "row" || lower == "tensor") {
             return true;
         }
         if (error != nullptr) {
-            *error = "invalid split mode '" + name + "' (expected layer or row)";
+            *error = "invalid split mode '" + name + "' (expected layer, row or tensor)";
         }
         return false;
     };
@@ -1142,6 +1247,32 @@ bool SDBackendManager::validate(std::string* error) const {
     }
     for (const auto& kv : split_mode_assignment_.module_names) {
         if (!validate_split_mode_name(kv.second)) {
+            return false;
+        }
+    }
+
+    // Tensor split is wired up for the diffusion model only and must be requested explicitly.
+    if (lower_copy(trim_copy(split_mode_assignment_.default_name)) == "tensor") {
+        if (error != nullptr) {
+            *error = "split mode 'tensor' must be set per module: use --split-mode diffusion=tensor";
+        }
+        return false;
+    }
+    for (const auto& kv : split_mode_assignment_.module_names) {
+        if (lower_copy(trim_copy(kv.second)) != "tensor") {
+            continue;
+        }
+        if (kv.first != SDBackendModule::DIFFUSION) {
+            if (error != nullptr) {
+                *error = std::string("split mode 'tensor' is only supported for the diffusion module, not '") +
+                         sd_backend_module_name(kv.first) + "'";
+            }
+            return false;
+        }
+        if (split_device_list(runtime_assignment_.get(kv.first)).size() < 2) {
+            if (error != nullptr) {
+                *error = "split mode 'tensor' needs at least two diffusion devices, e.g. --backend \"diffusion=cuda0&cuda1\"";
+            }
             return false;
         }
     }

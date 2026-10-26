@@ -567,8 +567,10 @@ ArgOptions SDContextParams::get_options() {
         {"",
          "--split-mode",
          "weight distribution for modules assigned multiple devices (--backend \"diffusion=cuda0&cuda1\"): "
-         "layer (whole transformer blocks per device, default) or row (matmul rows split across devices, CUDA only). "
-         "Accepts a single mode or per-module assignments, e.g. row or diffusion=row,te=layer",
+         "layer (whole transformer blocks per device, default), row (matmul rows split across devices, CUDA only) "
+         "or tensor (diffusion only: tensor parallelism on a GGML meta device, every device computes every layer; "
+         "Qwen Image 2.1, weights stay resident). "
+         "Accepts a single mode or per-module assignments, e.g. row or diffusion=row,te=layer or diffusion=tensor",
          (int)',',
          &split_mode},
         {"",

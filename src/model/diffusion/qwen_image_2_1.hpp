@@ -430,6 +430,12 @@ namespace Qwen {
                     }
                 }
             }
+            if (prefix_cache_enabled && sd::tp::backend_is_meta(backend)) {
+                // Cached prefix K/V would be runner-cache buffers on the meta backend,
+                // which only supports statically allocated (split) weights.
+                LOG_WARN("Qwen Image 2.1 prefix cache is not supported with --split-mode tensor; disabled");
+                prefix_cache_enabled = false;
+            }
             model.init(params_ctx, weights, prefix);
         }
 

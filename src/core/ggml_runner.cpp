@@ -42,7 +42,13 @@ void GGMLRunner::alloc_params_ctx() {
 }
 
 void GGMLRunner::free_params_ctx() {
+    if (tp_params_buffer_ != nullptr) {
+        ggml_backend_buffer_free(tp_params_buffer_);
+        tp_params_buffer_ = nullptr;
+        tp_params_bytes_  = 0;
+    }
     if (params_ctx != nullptr) {
+        sd::tp::unregister_context(params_ctx);
         ggml_free(params_ctx);
         params_ctx = nullptr;
     }
@@ -74,7 +80,9 @@ void GGMLRunner::rebuild_params_tensor_set() {
         return;
     }
     params_tensor_set_.clear();
-    if (params_ctx == nullptr) {
+    if (params_ctx == nullptr || tensor_parallel()) {
+        // Tensor-split params are resident meta tensors, not residency-managed params.
+        params_tensor_set_dirty_ = false;
         return;
     }
     for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
@@ -250,6 +258,14 @@ size_t GGMLRunner::retained_runtime_buffer_bytes(ggml_backend_t backend) const {
 
 void GGMLRunner::sync_runtime_residency() {
     if (auto manager = residency_manager.lock()) {
+        if (tensor_parallel()) {
+            // The meta compute buffer is allocated in full on every split device.
+            const size_t bytes = retained_runtime_buffer_bytes();
+            for (auto backend : tp_device_backends_) {
+                manager->update_runtime_residency(reinterpret_cast<uintptr_t>(this), backend, bytes);
+            }
+            return;
+        }
         manager->update_runtime_residency(reinterpret_cast<uintptr_t>(this),
                                           runtime_backend, retained_runtime_buffer_bytes());
         for (auto backend : extra_runtime_backends) {
@@ -640,7 +656,28 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
     }
     params_tensor_set_dirty_ = true;
     rebuild_params_tensor_set();
-    if (auto manager = residency_manager.lock()) {
+    if (tensor_parallel()) {
+        // Every statically allocated leaf must live on the meta backend; anything else
+        // (host or single-device weights) would be read with the wrong layout.
+        for (int i = 0; i < sd::ggml_graph_cut::leaf_count(graph); ++i) {
+            ggml_tensor* leaf = sd::ggml_graph_cut::leaf_tensor(graph, i);
+            ggml_tensor* root = leaf;
+            while (root->view_src != nullptr) {
+                root = root->view_src;
+            }
+            if (root->buffer == nullptr && root->data == nullptr) {
+                continue;  // graph input/intermediate, allocated by the compute allocator
+            }
+            if (!sd::tp::buffer_is_meta(root->buffer)) {
+                LOG_ERROR("%s tensor split: graph leaf '%s' is not allocated on the meta backend (buffer %s); "
+                          "this tensor is not supported with --split-mode tensor",
+                          get_desc().c_str(),
+                          root->name[0] != '\0' ? root->name : "<unnamed>",
+                          root->buffer != nullptr ? ggml_backend_buffer_name(root->buffer) : "none");
+                return std::nullopt;
+            }
+        }
+    } else if (auto manager = residency_manager.lock()) {
         for (int i = 0; i < sd::ggml_graph_cut::leaf_count(graph); ++i) {
             auto* parameter = manager->resolve_param_tensor(sd::ggml_graph_cut::leaf_tensor(graph, i));
             if (parameter != nullptr)
@@ -701,6 +738,28 @@ void GGMLRunner::set_runtime_backends(const std::vector<ggml_backend_t>& backend
     graph_cut_layer_split_primary_notice_logged_ = false;
 }
 
+bool GGMLRunner::alloc_tensor_parallel_params(std::string* error) {
+    if (!tensor_parallel()) {
+        if (error != nullptr) {
+            *error = "runtime backend is not a tensor-split (meta) backend";
+        }
+        return false;
+    }
+    if (tp_params_buffer_ != nullptr) {
+        return true;
+    }
+    // Keep room for the compute buffer and the other runners on the split devices.
+    constexpr size_t headroom = 256ULL * 1024ULL * 1024ULL;
+    size_t bytes              = 0;
+    tp_params_buffer_         = sd::tp::alloc_ctx_tensors(params_ctx, runtime_backend, headroom, &bytes, error);
+    if (tp_params_buffer_ == nullptr) {
+        return false;
+    }
+    tp_params_bytes_         = bytes;
+    params_tensor_set_dirty_ = true;
+    return true;
+}
+
 static size_t add_bytes(size_t a, size_t b) {
     return b > SIZE_MAX - a ? SIZE_MAX : a + b;
 }
@@ -729,6 +788,13 @@ std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
         const size_t cache_bytes = size.backend == runtime_backend ? pending_cache_bytes : 0;
         const size_t pending     = add_bytes(size.bytes > reusable ? size.bytes - reusable : 0, cache_bytes);
         size_t limit             = max_graph_vram_bytes;
+        if (tensor_parallel() && size.backend == runtime_backend) {
+            // A meta compute buffer of N bytes allocates N bytes on every split device.
+            for (auto backend : tp_device_backends_) {
+                requests.push_back({backend, reinterpret_cast<uintptr_t>(this), pending, retained, limit});
+            }
+            continue;
+        }
         if (is_multi_device()) {
             size_t index = 0;
             if (size.backend != runtime_backend) {
@@ -768,7 +834,13 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
     }
     auto scheduler = workspace_.scheduler();
     ggml_status status;
-    if (scheduler != nullptr) {
+    if (tensor_parallel() && scheduler == nullptr) {
+        if (sd_get_backend_eval_callback() != nullptr && !tp_eval_callback_warned_) {
+            LOG_WARN("%s: eval callback is not supported with --split-mode tensor; ignoring", get_desc().c_str());
+            tp_eval_callback_warned_ = true;
+        }
+        status = ggml_backend_graph_compute(runtime_backend, graph);
+    } else if (scheduler != nullptr) {
         if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
             LOG_WARN("%s: eval callback is not supported with the backend scheduler; ignoring", get_desc().c_str());
             multi_device_eval_callback_warned = true;
@@ -847,7 +919,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         return fits(requests, params);
     };
     auto manager         = residency_manager.lock();
-    const bool segmented = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
+    const bool segmented = !is_multi_device() && !tensor_parallel() && !sd_backend_is_cpu(runtime_backend) &&
                            manager != nullptr && manager->segmented_compute_enabled() &&
                            cached_plan.valid && cached_plan.has_cuts && cached_plan.segments.size() > 1 &&
                            !fits_monolithic();

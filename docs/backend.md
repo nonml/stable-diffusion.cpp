@@ -127,6 +127,38 @@ Direct ("immediately") LoRA application cannot patch row-split tensors; with
 explicit `--lora-apply-mode immediately` skips the split tensors with a
 warning.
 
+### Tensor split (`--split-mode diffusion=tensor`)
+
+Tensor split runs the diffusion model on a GGML "meta" device built from the
+listed devices (the same mechanism as llama.cpp `-sm tensor`). Every device
+computes every layer on its slice of the weights:
+
+- attention q/k/v: split by heads (output columns); attention output: split by
+  input rows, followed by an all-reduce;
+- MLP gate/up: split by output columns (fused `gate_up` keeps each device's
+  gate and up halves together); MLP output: split by input rows + all-reduce;
+- embeddings, modulation, norms and biases: replicated on every device.
+
+```shell
+sd-cli --diffusion-model qwen-image-2.1.gguf ... --backend "diffusion=cuda0&cuda1" --split-mode diffusion=tensor
+```
+
+Current limitations:
+
+- only the Qwen Image 2.1 diffusion model, only the diffusion module, and only
+  GPU devices; the text encoder and VAE stay on their own single device;
+- the split weights are allocated once and stay resident (no params backend,
+  graph segmentation, prefetch or auto-fit); each device holds its share of the
+  weights plus a full-size compute buffer;
+- flash attention is required (`diffusion=off` is rejected); SageAttention and
+  the Qwen Image 2.1 prefix cache are disabled;
+- LoRAs are applied at runtime only (`immediately` falls back to `at_runtime`).
+  Only `lora_up`/`lora_down` (+ `lora_mid`, alpha, scale) LoRAs whose layout
+  matches the split weights are accepted; others (LoHa/LoKr/diff on split
+  weights, unfused gate/proj LoRAs on a fused `gate_up` model) fail with an error
+  instead of being skipped;
+- the GGML backend eval callback is ignored.
+
 ## Automatic placement (`--auto-fit on|off`)
 
 `--auto-fit` requires `on` or `off` and defaults to `on` when omitted.

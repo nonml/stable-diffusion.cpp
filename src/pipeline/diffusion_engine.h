@@ -106,6 +106,12 @@ public:
     std::string split_mode_spec;
     bool auto_fit_enabled = false;
 
+    // --split-mode tensor: diffusion weights allocated on the meta backend, waiting to be
+    // uploaded once metadata validation has configured the ignore lists, plus their names
+    // (they are not registered with the model manager) for LoRA name resolution.
+    std::map<std::string, ggml_tensor*> tensor_parallel_pending_load_;
+    std::set<std::string> tensor_parallel_model_tensor_names_;
+
     bool diffusion_conv_direct = false;
 
     bool is_using_v_parameterization     = false;
@@ -286,6 +292,12 @@ public:
                                 const std::shared_ptr<T>& model,
                                 SDBackendModule module,
                                 size_t* params_mem_size = nullptr);
+
+    bool register_tensor_parallel_runner_params(ModelComponent component,
+                                                GGMLRunner& runner,
+                                                SDBackendModule module,
+                                                std::map<std::string, ggml_tensor*> group_tensors,
+                                                size_t* params_mem_size);
 
     template <typename T>
     bool register_row_split_runner_params(ModelComponent component,

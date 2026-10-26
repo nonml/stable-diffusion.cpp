@@ -37,6 +37,10 @@ struct LoraModel : public GGMLRunner {
     bool params_follow_compute                 = false;
     std::vector<ggml_tensor*> registered_params;
     std::map<ggml_tensor*, float> scalar_values;
+    // --split-mode tensor: non-scalar LoRA tensors live in their own context, allocated
+    // on the meta backend with split states matching their base weights.
+    ggml_context* tp_ctx                = nullptr;
+    ggml_backend_buffer_t tp_buffer     = nullptr;
 
     typedef std::function<bool(const std::string&)> filter_t;
 
@@ -53,6 +57,19 @@ struct LoraModel : public GGMLRunner {
         if (auto manager = std::dynamic_pointer_cast<ModelManager>(residency_manager.lock())) {
             GGML_ASSERT(manager->unregister_param_tensors(registered_params));
         }
+        free_tensor_parallel_tensors();
+    }
+
+    void free_tensor_parallel_tensors() {
+        if (tp_buffer != nullptr) {
+            ggml_backend_buffer_free(tp_buffer);
+            tp_buffer = nullptr;
+        }
+        if (tp_ctx != nullptr) {
+            sd::tp::unregister_context(tp_ctx);
+            ggml_free(tp_ctx);
+            tp_ctx = nullptr;
+        }
     }
 
     std::string get_desc() override {
@@ -63,8 +80,9 @@ struct LoraModel : public GGMLRunner {
         auto model_manager = std::dynamic_pointer_cast<ModelManager>(residency_manager.lock());
         if (model_manager == nullptr)
             return false;
-        if (load_failed || !registered_params.empty())
+        if (load_failed || !registered_params.empty() || tp_ctx != nullptr)
             return false;
+        const bool tensor_parallel = sd::tp::backend_is_meta(runtime_backend);
         model_manager->set_n_threads(n_threads);
         metadata_alpha      = -1.f;
         const auto metadata = model_manager->loader().file_metadata(source_file);
@@ -96,11 +114,24 @@ struct LoraModel : public GGMLRunner {
         std::map<std::string, ggml_tensor*> tensors;
         std::map<std::string, ggml_tensor*> scalars;
         std::set<std::string> scalar_names;
+        if (tensor_parallel) {
+            size_t n_tensors = 0;
+            for (const auto& entry : sources) {
+                if (!filter || filter(entry.first))
+                    ++n_tensors;
+            }
+            tp_ctx = ggml_init({(n_tensors + 1) * ggml_tensor_overhead(), nullptr, true});
+            if (tp_ctx == nullptr) {
+                LOG_ERROR("LoRA '%s': failed to create the tensor split context", file_path.c_str());
+                return false;
+            }
+        }
         for (const auto& [name, source] : sources) {
             if (filter && !filter(name))
                 continue;
             const bool scalar  = source.nelements() == 1 && (ends_with(name, ".alpha") || ends_with(name, ".scale"));
-            auto* tensor       = ggml_new_tensor(params_ctx, scalar ? GGML_TYPE_F32 : source.type, source.n_dims, source.ne);
+            auto* tensor       = ggml_new_tensor(tensor_parallel && !scalar ? tp_ctx : params_ctx,
+                                                 scalar ? GGML_TYPE_F32 : source.type, source.n_dims, source.ne);
             lora_tensors[name] = tensor;
             if (scalar) {
                 tensor->data  = &scalar_values[tensor];
@@ -120,6 +151,9 @@ struct LoraModel : public GGMLRunner {
             if (!model_manager->loader().load_file_tensors(source_file, source_version, callback, scalar_names))
                 return false;
         }
+        if (tensor_parallel) {
+            return init_tensor_parallel_params(*model_manager, tensors);
+        }
         if (!model_manager->register_param_tensors(ModelComponent::LoRA, tensors, residency_mode,
                                                    runtime_backend, params_backend, nullptr, false, params_follow_compute,
                                                    nullptr, source_file, source_version))
@@ -127,6 +161,36 @@ struct LoraModel : public GGMLRunner {
         for (const auto& entry : tensors)
             registered_params.push_back(entry.second);
         return model_manager->validate_registered_tensors();
+    }
+
+    // Splits the LoRA tensors like their base weights, allocates them on the meta
+    // backend and uploads them once. They are not residency-managed.
+    bool init_tensor_parallel_params(ModelManager& model_manager, const std::map<std::string, ggml_tensor*>& tensors) {
+        if (tensors.empty()) {
+            return true;
+        }
+        std::string error;
+        if (!sd::tp::assign_lora_splits(tensors, sd::tp::meta_device_count(runtime_backend), &error)) {
+            LOG_ERROR("LoRA '%s' cannot be used with --split-mode tensor: %s", file_path.c_str(), error.c_str());
+            free_tensor_parallel_tensors();
+            return false;
+        }
+        constexpr size_t headroom = 128ULL * 1024ULL * 1024ULL;
+        size_t bytes              = 0;
+        tp_buffer                 = sd::tp::alloc_ctx_tensors(tp_ctx, runtime_backend, headroom, &bytes, &error);
+        if (tp_buffer == nullptr) {
+            LOG_ERROR("LoRA '%s': tensor split allocation failed: %s", file_path.c_str(), error.c_str());
+            free_tensor_parallel_tensors();
+            return false;
+        }
+        if (!model_manager.load_unmanaged_tensors(ModelComponent::LoRA, tensors, source_file, source_version)) {
+            LOG_ERROR("LoRA '%s': loading tensor split weights failed", file_path.c_str());
+            free_tensor_parallel_tensors();
+            return false;
+        }
+        LOG_INFO("LoRA '%s': %zu tensors resident on the tensor split devices (%.2f MB total)",
+                 file_path.c_str(), tensors.size(), bytes / (1024.0 * 1024.0));
+        return true;
     }
 
     float scalar_value(ggml_tensor* tensor) const {
@@ -140,6 +204,7 @@ struct LoraModel : public GGMLRunner {
             GGML_ASSERT(manager->unregister_param_tensors(registered_params));
         }
         registered_params.clear();
+        free_tensor_parallel_tensors();
         free_params_ctx();
         alloc_params_ctx();
         lora_tensors.clear();

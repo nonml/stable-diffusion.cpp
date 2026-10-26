@@ -9,11 +9,33 @@
 
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_graph_cut.h"
+#include "core/tensor_parallel.h"
 #include "core/util.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 
 namespace sd {
+    namespace {
+        // The GGML scheduler cannot mix a meta (tensor-split) backend with others, so a
+        // tensor-split graph must be fully supported by the meta backend.
+        bool reject_meta_scheduler(ggml_backend_t backend, ggml_cgraph* graph) {
+            if (!tp::backend_is_meta(backend)) {
+                return false;
+            }
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                ggml_tensor* node = ggml_graph_node(graph, i);
+                if (!ggml_backend_supports_op(backend, node)) {
+                    LOG_ERROR("tensor split: op %s (node '%s') is not supported by the split devices; "
+                              "--split-mode tensor cannot run this graph",
+                              ggml_op_desc(node), node->name);
+                    return true;
+                }
+            }
+            LOG_ERROR("tensor split: graph requires the backend scheduler, which --split-mode tensor does not support");
+            return true;
+        }
+    }  // namespace
+
     ComputeWorkspace::~ComputeWorkspace() {
         segment_end();
         release();
@@ -89,6 +111,9 @@ namespace sd {
     bool ComputeWorkspace::allocate(ggml_cgraph* graph, const AssignNodes& assign_nodes) {
         GGML_ASSERT(!active_);
         const bool use_scheduler = needs_scheduler(graph);
+        if (use_scheduler && reject_meta_scheduler(backend_, graph)) {
+            return false;
+        }
         if (use_scheduler) {
             if (allocator_ != nullptr) {
                 release();
@@ -141,6 +166,9 @@ namespace sd {
         const AssignNodes& assign_nodes) {
         if (!needs_scheduler(graph)) {
             return {{{backend_, direct_bytes}}, false};
+        }
+        if (reject_meta_scheduler(backend_, graph)) {
+            return {};
         }
         std::vector<const ggml_tensor*> tensors;
         std::unordered_set<const ggml_tensor*> seen;

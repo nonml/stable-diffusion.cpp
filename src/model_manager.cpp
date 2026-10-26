@@ -406,6 +406,78 @@ bool ModelManager::load_all_params_eagerly() {
     return load_tensors_to_params_backend(all_states);
 }
 
+bool ModelManager::load_unmanaged_tensors(ModelComponent component,
+                                          const std::map<std::string, ggml_tensor*>& tensors,
+                                          ModelLoader::FileId source_file,
+                                          SDVersion source_version) {
+    const auto scoped_sources = source_file != 0 ? model_loader_.file_tensors(source_file, source_version) : String2TensorStorage{};
+    const auto& sources       = source_file != 0 ? scoped_sources : model_loader_.get_tensor_storage_map();
+
+    std::map<std::string, ggml_tensor*> batch;
+    for (const auto& pair : tensors) {
+        if (pair.second == nullptr) {
+            continue;
+        }
+        TensorState state;
+        state.name           = pair.first;
+        state.tensor         = pair.second;
+        state.component      = component;
+        state.source_file    = source_file;
+        state.source_version = source_version;
+        state.sources        = find_tensor_sources(state, sources);
+        if (should_ignore(state) || is_optional_missing_tensor(state.name)) {
+            continue;
+        }
+        if (!validate_tensor(state)) {
+            return false;
+        }
+        if (state.tensor->data == nullptr || state.tensor->buffer == nullptr) {
+            LOG_ERROR("%s tensor '%s' has no backend storage", model_component_name(component), state.name.c_str());
+            return false;
+        }
+        if (state.sources.size() > 1) {
+            // Assembled on the host and uploaded with one whole-tensor set.
+            if (!load_tensor_parts(state)) {
+                LOG_ERROR("%s tensor '%s': loading its %zu parts failed",
+                          model_component_name(component), state.name.c_str(), state.sources.size());
+                return false;
+            }
+            continue;
+        }
+        batch[state.name] = state.tensor;
+    }
+    if (batch.empty()) {
+        return true;
+    }
+
+    std::set<std::string> names;
+    for (const auto& entry : batch) {
+        names.insert(entry.first);
+    }
+    std::set<std::string> loaded;
+    std::mutex mutex;
+    auto callback = [&](const TensorStorage& source, ggml_tensor** dst) {
+        *dst       = nullptr;
+        auto found = batch.find(source.name);
+        if (found == batch.end()) {
+            return true;
+        }
+        *dst = found->second;
+        std::lock_guard<std::mutex> lock(mutex);
+        loaded.insert(source.name);
+        return true;
+    };
+    const bool success = source_file == 0
+                             ? model_loader_.load_tensors(callback, enable_mmap_, &names)
+                             : model_loader_.load_file_tensors(source_file, source_version, callback, names, enable_mmap_);
+    if (!success || loaded != names) {
+        LOG_ERROR("%s: loading %zu unmanaged tensors failed (%zu loaded)",
+                  model_component_name(component), names.size(), loaded.size());
+        return false;
+    }
+    return true;
+}
+
 bool ModelManager::validate_registered_tensors() {
     bool ok = true;
     for (const auto& state : tensor_states_) {
