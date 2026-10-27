@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include "core/ggml_graph_cut.h"
+#include "core/tensor_parallel.h"
 #include "core/util.h"
 
 namespace sd {
@@ -21,6 +22,7 @@ namespace sd {
 
     CachedTensor::~CachedTensor() {
         ggml_backend_buffer_free(buffer);
+        tp::unregister_context(context);
         ggml_free(context);
     }
 
@@ -77,6 +79,38 @@ namespace sd {
 
     ggml_tensor* RunnerCache::get(const std::string& name) const {
         return cached_tensor(committed_, name);
+    }
+
+    ggml_tensor* RunnerCache::reserve(const std::string& name,
+                                      ggml_type type,
+                                      const int64_t* ne,
+                                      const ggml_backend_meta_split_state* split) {
+        auto entry     = std::make_unique<CachedTensor>();
+        entry->context = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+        if (entry->context == nullptr) {
+            return nullptr;
+        }
+        entry->tensor = ggml_new_tensor(entry->context, type, GGML_MAX_DIMS, ne);
+        ggml_set_name(entry->tensor, name.c_str());
+        if (tp::backend_is_meta(backend_)) {
+            // The meta backend reads the distribution of static tensors from the split
+            // registry; the GGML meta allocator aborts on OOM, so check memory first.
+            tp::register_tensor(entry->tensor, split != nullptr ? *split : tp::mirrored_state());
+            std::string error;
+            entry->buffer = tp::alloc_ctx_tensors(entry->context, backend_, 0, nullptr, &error);
+            if (entry->buffer == nullptr) {
+                LOG_WARN("cache tensor '%s': %s", name.c_str(), error.c_str());
+                return nullptr;
+            }
+        } else {
+            entry->buffer = ggml_backend_alloc_ctx_tensors(entry->context, backend_);
+            if (entry->buffer == nullptr) {
+                return nullptr;
+            }
+        }
+        ggml_tensor* tensor = entry->tensor;
+        pending_[name]      = std::move(entry);
+        return tensor;
     }
 
     void RunnerCache::stage(const std::string& name, ggml_tensor* tensor) {

@@ -924,10 +924,6 @@ bool StableDiffusionGGML::set_sage_attention_enabled(bool enabled) {
     if (!diffusion_model) {
         return false;
     }
-    if (enabled && backend_manager.tensor_parallel_active(SDBackendModule::DIFFUSION)) {
-        LOG_WARN("SageAttention is not supported with --split-mode tensor; using flash attention instead");
-        return true;
-    }
     if (enabled) {
 #ifndef SD_USE_UPSTREAM_GGML
         auto* ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});

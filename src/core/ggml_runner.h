@@ -349,6 +349,18 @@ public:
         return cache_.get(name);
     }
 
+    // See RunnerCache::reserve. Starts the runner first so the reservation survives
+    // the cache reset done by runner_start().
+    ggml_tensor* reserve_cache_tensor(const std::string& name,
+                                      ggml_type type,
+                                      const int64_t* ne,
+                                      const ggml_backend_meta_split_state* split) {
+        if (!runner_start()) {
+            return nullptr;
+        }
+        return cache_.reserve(name, type, ne, split);
+    }
+
     std::optional<sd::Tensor<float>> compute(get_graph_cb_t get_graph,
                                              int n_threads,
                                              bool auto_runner_end                      = true,

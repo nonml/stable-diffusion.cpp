@@ -39,6 +39,13 @@ namespace sd {
 
         ggml_tensor* get(const std::string& name) const;
         void stage(const std::string& name, ggml_tensor* tensor);
+        // Allocates a pending cache tensor that a graph writes into directly (ggml_cpy);
+        // it is committed by graph_end(true). On a meta (tensor-split) backend `split`
+        // gives its distribution (mirrored when null). Returns nullptr on failure.
+        ggml_tensor* reserve(const std::string& name,
+                             ggml_type type,
+                             const int64_t* ne,
+                             const ggml_backend_meta_split_state* split);
         const std::map<std::string, ggml_tensor*>& outputs() const { return outputs_; }
         size_t pending_bytes(ggml_cgraph* graph) const;
         size_t resident_bytes(ggml_backend_dev_t device) const;

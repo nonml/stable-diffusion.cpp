@@ -150,8 +150,10 @@ Current limitations:
 - the split weights are allocated once and stay resident (no params backend,
   graph segmentation, prefetch or auto-fit); each device holds its share of the
   weights plus a full-size compute buffer;
-- flash attention is required (`diffusion=off` is rejected); SageAttention and
-  the Qwen Image 2.1 prefix cache are disabled;
+- flash attention is required (`diffusion=off` is rejected); `--sage-attn` works;
+- the Qwen Image 2.1 prefix cache is split by heads like the live K/V. Its cache
+  type must have a block size that divides the head size (`q8_0`, `f16`, `f32`);
+  other types fall back to `auto`;
 - LoRAs are applied at runtime only (`immediately` falls back to `at_runtime`).
   Only `lora_up`/`lora_down` (+ `lora_mid`, alpha, scale) LoRAs whose layout
   matches the split weights are accepted; others (LoHa/LoKr/diff on split

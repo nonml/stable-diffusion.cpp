@@ -137,6 +137,12 @@ namespace Qwen {
         int64_t prefix_length = 0;
         ggml_type type        = GGML_TYPE_F32;
         bool* flash_attn_used = nullptr;
+        // Tensor split: K/V are cached unpacked ([head_dim, P, heads] / [head_dim, heads, P])
+        // in tensors reserved up front with the live K/V head split. STORE writes into
+        // them in-graph, because the unsegmented split graph would otherwise keep every
+        // layer's copy alive in the compute buffer until the graph ends.
+        bool split_kv                                      = false;
+        const std::map<std::string, ggml_tensor*>* targets = nullptr;
     };
 
     class QwenImage21ZeroCenterRMSNorm : public RMSNorm {
@@ -197,6 +203,10 @@ namespace Qwen {
                 ctx->expand_graph(q);
                 auto persist = [&](ggml_tensor* tensor, int axis, const char* name) {
                     auto part = ggml_ext_slice(ctx->ggml_ctx, tensor, axis, 0, cache.prefix_length);
+                    if (cache.targets != nullptr) {
+                        ctx->expand_graph(ggml_cpy(ctx->ggml_ctx, part, cache.targets->at(cache.name + "." + name)));
+                        return;
+                    }
                     // Pack the contiguous data into wider rows so quantization blocks
                     // can exceed head_dim without padding or changing element order.
                     part      = ggml_reshape_2d(ctx->ggml_ctx, part, x->ne[0], cache.prefix_length);
@@ -228,8 +238,10 @@ namespace Qwen {
                 if (prefix_v->type != v->type) {
                     prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
                 }
-                prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
-                prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
+                if (!cache.split_kv) {
+                    prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
+                    prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
+                }
                 k        = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
                 v        = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
                 result   = attend(q, k, v, nullptr);
@@ -430,13 +442,80 @@ namespace Qwen {
                     }
                 }
             }
-            if (prefix_cache_enabled && sd::tp::backend_is_meta(backend)) {
-                // Cached prefix K/V would be runner-cache buffers on the meta backend,
-                // which only supports statically allocated (split) weights.
-                LOG_WARN("Qwen Image 2.1 prefix cache is not supported with --split-mode tensor; disabled");
-                prefix_cache_enabled = false;
+            if (prefix_cache_type != GGML_TYPE_COUNT && sd::tp::backend_is_meta(backend) &&
+                config.head_dim % ggml_blck_size(prefix_cache_type) != 0) {
+                // Split caches are stored per head, so a block must fit in head_dim.
+                LOG_WARN("ignoring Qwen Image 2.1 cache type '%s' with --split-mode tensor: block size %" PRId64 " does not divide head dim %" PRId64,
+                         ggml_type_name(prefix_cache_type), ggml_blck_size(prefix_cache_type), config.head_dim);
+                prefix_cache_type = GGML_TYPE_COUNT;
             }
             model.init(params_ctx, weights, prefix);
+        }
+
+        // Head splits of the cached K/V on the meta backend, derived from the split
+        // to_k / to_v weights (output columns, whole heads). Resolved on first use
+        // because the split states are assigned after construction.
+        bool tp_kv_split_resolved_ = false;
+        bool tp_kv_split_valid_    = false;
+        ggml_backend_meta_split_state tp_k_split_;
+        ggml_backend_meta_split_state tp_v_split_;
+
+        bool resolve_tp_kv_split() {
+            if (tp_kv_split_resolved_) {
+                return tp_kv_split_valid_;
+            }
+            tp_kv_split_resolved_ = true;
+            std::map<std::string, ggml_tensor*> tensors;
+            model.get_param_tensors(tensors, "");
+            const size_t n_devices = sd::tp::meta_device_count(runtime_backend);
+            auto head_split        = [&](const char* suffix, int axis, ggml_backend_meta_split_state* out) {
+                for (const auto& [name, tensor] : tensors) {
+                    if (!ends_with(name, suffix)) {
+                        continue;
+                    }
+                    ggml_backend_meta_split_state weight;
+                    if (!sd::tp::lookup_tensor(tensor, &weight) || weight.axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+                        weight.n_segments != 1 || weight.nr[0] != 1) {
+                        return false;
+                    }
+                    *out            = sd::tp::mirrored_state();
+                    out->axis       = static_cast<ggml_backend_meta_split_axis>(axis);
+                    out->n_segments = 1;
+                    out->nr[0]      = 1;
+                    for (size_t j = 0; j < n_devices; ++j) {
+                        if (weight.ne[j] % config.head_dim != 0) {
+                            return false;
+                        }
+                        out->ne[j] = weight.ne[j] / config.head_dim;
+                    }
+                    return true;
+                }
+                return false;
+            };
+            // k: [head_dim, P, heads], v: [head_dim, heads, P]
+            tp_kv_split_valid_ = head_split("transformer_blocks.0.attn.to_k.weight", 2, &tp_k_split_) &&
+                                 head_split("transformer_blocks.0.attn.to_v.weight", 1, &tp_v_split_);
+            if (!tp_kv_split_valid_) {
+                LOG_WARN("Qwen Image 2.1: cannot derive the K/V head split for --split-mode tensor; prefix cache disabled");
+            }
+            return tp_kv_split_valid_;
+        }
+
+        bool reserve_split_prefix_cache(const QwenImage21PrefixCache& cache, std::map<std::string, ggml_tensor*>* targets) {
+            const int64_t heads   = config.hidden_size / config.head_dim;
+            const int64_t k_ne[4] = {config.head_dim, cache.prefix_length, heads, 1};
+            const int64_t v_ne[4] = {config.head_dim, heads, cache.prefix_length, 1};
+            for (int i = 0; i < config.num_layers; ++i) {
+                const auto name = cache.name + "." + std::to_string(i);
+                auto k          = reserve_cache_tensor(name + ".k", cache.type, k_ne, &tp_k_split_);
+                auto v          = k == nullptr ? nullptr : reserve_cache_tensor(name + ".v", cache.type, v_ne, &tp_v_split_);
+                if (v == nullptr) {
+                    return false;
+                }
+                (*targets)[name + ".k"] = k;
+                (*targets)[name + ".v"] = v;
+            }
+            return true;
         }
 
         std::string get_desc() override { return "qwen_image_2_1"; }
@@ -446,13 +525,22 @@ namespace Qwen {
         }
 
         bool has_prefix_cache(const QwenImage21PrefixCache& cache) {
+            const int64_t heads = config.hidden_size / config.head_dim;
+            const bool split    = cache.split_kv;
+            const std::array<int64_t, 4> k_shape =
+                split ? std::array<int64_t, 4>{config.head_dim, cache.prefix_length, heads, 1}
+                      : std::array<int64_t, 4>{config.hidden_size, cache.prefix_length, 1, 1};
+            const std::array<int64_t, 4> v_shape =
+                split ? std::array<int64_t, 4>{config.head_dim, heads, cache.prefix_length, 1}
+                      : k_shape;
+            auto matches = [&](const ggml_tensor* tensor, const std::array<int64_t, 4>& shape) {
+                return tensor != nullptr && tensor->type == cache.type && tensor->ne[0] == shape[0] &&
+                       tensor->ne[1] == shape[1] && tensor->ne[2] == shape[2] && tensor->ne[3] == shape[3];
+            };
             for (int i = 0; i < config.num_layers; ++i) {
                 const auto name = cache.name + "." + std::to_string(i);
-                auto k          = get_cache_tensor_by_name(name + ".k");
-                auto v          = get_cache_tensor_by_name(name + ".v");
-                if (k == nullptr || v == nullptr || k->type != cache.type || v->type != cache.type ||
-                    k->ne[0] != config.hidden_size || k->ne[1] != cache.prefix_length || k->ne[2] != 1 || k->ne[3] != 1 ||
-                    v->ne[0] != config.hidden_size || v->ne[1] != cache.prefix_length || v->ne[2] != 1 || v->ne[3] != 1) {
+                if (!matches(get_cache_tensor_by_name(name + ".k"), k_shape) ||
+                    !matches(get_cache_tensor_by_name(name + ".v"), v_shape)) {
                     return false;
                 }
             }
@@ -492,8 +580,11 @@ namespace Qwen {
                 prefix_cache_auto_f32 = false;
             }
             QwenImage21PrefixCache cache;
-            if (prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
-                cache.name          = "qwen_image_2_1.prefix." + std::to_string(extra->prefix_id) +
+            const bool split_kv = tensor_parallel();
+            if (prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0 &&
+                (!split_kv || resolve_tp_kv_split())) {
+                cache.split_kv      = split_kv;
+                cache.name         = "qwen_image_2_1.prefix." + std::to_string(extra->prefix_id) +
                                       ".circular." + std::to_string(circular_x_enabled) + std::to_string(circular_y_enabled);
                 cache.prefix_length = layout.prefix_length;
                 if (prefix_cache_type != GGML_TYPE_COUNT) {
@@ -505,11 +596,20 @@ namespace Qwen {
                 cache.mode = has_prefix_cache(cache) ? QwenImage21PrefixCache::Mode::REUSE : QwenImage21PrefixCache::Mode::STORE;
             }
             bool flash_attn_used = true;
+            bool reserve_failed  = false;
             auto run             = [&](const QwenImage21PrefixCache& active_cache) {
                 flash_attn_used    = true;
                 auto checked_cache = active_cache;
                 if (prefix_cache_type == GGML_TYPE_COUNT && active_cache.type == GGML_TYPE_F16) {
                     checked_cache.flash_attn_used = &flash_attn_used;
+                }
+                std::map<std::string, ggml_tensor*> targets;
+                if (checked_cache.split_kv && checked_cache.mode == QwenImage21PrefixCache::Mode::STORE) {
+                    if (!reserve_split_prefix_cache(checked_cache, &targets)) {
+                        reserve_failed = true;
+                        return sd::Tensor<float>{};
+                    }
+                    checked_cache.targets = &targets;
                 }
                 const bool cached = active_cache.mode == QwenImage21PrefixCache::Mode::REUSE;
                 mask_data.clear();
@@ -584,7 +684,7 @@ namespace Qwen {
                 LOG_DEBUG("Qwen Image 2.1: Flash Attention unavailable; using F32 prefix caching for this sampling run");
                 result = run(cache);
             }
-            if (result.empty() && last_compute_status() == GGML_STATUS_ALLOC_FAILED &&
+            if (result.empty() && (reserve_failed || last_compute_status() == GGML_STATUS_ALLOC_FAILED) &&
                 (cache.mode != QwenImage21PrefixCache::Mode::NONE || !cache_.empty())) {
                 // The failed graph has ended before persistent inputs are released.
                 free_cache_ctx_and_buffer();
